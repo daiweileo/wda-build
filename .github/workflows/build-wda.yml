@@ -1,30 +1,44 @@
-# 用途：从官方 appium/WebDriverAgent 源码构建 WDA v10.5.4（未签名 ipa，最低支持 iOS 12）
-# 放置位置：仓库根目录 .github/workflows/build-wda.yml
-# 运行方式：仓库页 Actions 标签 → 选中本工作流 → Run workflow → 完成后在 Run 页面 Artifacts 下载
-name: Build WebDriverAgent v10.5.4 (unsigned, iOS 12+)
+# 用途：从官方 appium/WebDriverAgent 源码构建 iOS 12 可用的 WDA（未签名 ipa）
+# 放置位置：仓库根目录 .github/workflows/build-wda.yml（覆盖旧内容）
+# 运行方式：Actions → Run workflow → 两个 job 并行跑 v10.5.4 / v9.15.3
+#          下载“成功且未变红”那个 job 的 artifact（优先 v10.5.4）
+name: Build WebDriverAgent (unsigned, iOS 12)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - wda_ref: v10.5.4
+            artifact: WebDriverAgent-v10.5.4-ipa
+          - wda_ref: v9.15.3
+            artifact: WebDriverAgent-v9.15.3-ipa
     runs-on: macos-15
+    name: Build ${{ matrix.wda_ref }}
     steps:
-      - name: Show available Xcode versions
-        run: ls /Applications | grep -i xcode || true
+      - name: Xcode version
+        run: xcodebuild -version
 
-      - name: Select Xcode 16.4
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '16.4'
-
-      - name: Checkout official WebDriverAgent source (v10.5.4)
+      - name: Checkout official WebDriverAgent source (${{ matrix.wda_ref }})
         uses: actions/checkout@v4
         with:
           repository: appium/WebDriverAgent
-          ref: v10.5.4
+          ref: ${{ matrix.wda_ref }}
 
-      - name: Build (unsigned, for real device)
+      - name: Diagnostics (before build)
+        run: |
+          echo "== HEAD =="
+          git rev-parse HEAD
+          echo "== deployment target occurrences in pbxproj =="
+          grep -o "IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*" WebDriverAgent.xcodeproj/project.pbxproj | sort | uniq -c
+          echo "== effective build settings =="
+          xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -showBuildSettings 2>/dev/null | grep -E "IPHONEOS_DEPLOYMENT_TARGET|MAXIMUM_VALID" || true
+
+      - name: Build (unsigned, forced iOS 12.0 target, real device)
         run: |
           xcodebuild build-for-testing \
             -project WebDriverAgent.xcodeproj \
@@ -32,14 +46,22 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
+            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
-      - name: Package ipa
+      - name: Verify built MinimumOSVersion == 12.0 (hard check)
         run: |
           APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
           test -d "$APP" || { find build -maxdepth 5 -name '*.app'; exit 1; }
+          MIN=$(plutil -extract MinimumOSVersion raw "$APP/Info.plist")
+          echo "built MinimumOSVersion = $MIN"
+          [ "$MIN" = "12.0" ] || { echo "FAIL: expected 12.0, got $MIN"; exit 1; }
+
+      - name: Package ipa
+        run: |
+          APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
           mkdir Payload
           cp -R "$APP" Payload/
           zip -qry WebDriverAgent.ipa Payload
@@ -48,5 +70,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WebDriverAgent-v10.5.4-ipa
+          name: ${{ matrix.artifact }}
           path: WebDriverAgent.ipa
