@@ -1,0 +1,52 @@
+# 用途：从官方 appium/WebDriverAgent 源码构建 WDA v10.5.4（未签名 ipa，最低支持 iOS 12）
+# 放置位置：仓库根目录 .github/workflows/build-wda.yml
+# 运行方式：仓库页 Actions 标签 → 选中本工作流 → Run workflow → 完成后在 Run 页面 Artifacts 下载
+name: Build WebDriverAgent v10.5.4 (unsigned, iOS 12+)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Show available Xcode versions
+        run: ls /Applications | grep -i xcode || true
+
+      - name: Select Xcode 16.4
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.4'
+
+      - name: Checkout official WebDriverAgent source (v10.5.4)
+        uses: actions/checkout@v4
+        with:
+          repository: appium/WebDriverAgent
+          ref: v10.5.4
+
+      - name: Build (unsigned, for real device)
+        run: |
+          xcodebuild build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package ipa
+        run: |
+          APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
+          test -d "$APP" || { find build -maxdepth 5 -name '*.app'; exit 1; }
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry WebDriverAgent.ipa Payload
+          ls -la WebDriverAgent.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebDriverAgent-v10.5.4-ipa
+          path: WebDriverAgent.ipa
