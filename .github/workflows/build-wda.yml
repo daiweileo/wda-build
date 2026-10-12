@@ -1,76 +1,17 @@
 # 用途：从官方 appium/WebDriverAgent 源码构建 iOS 12 可用的 WDA（未签名 ipa）
 # 放置位置：仓库根目录 .github/workflows/build-wda.yml（覆盖旧内容）
-# 双路线并行：
-#   A: macos-14 + Xcode 15.4 原生构建（首选；若 runner 已退役则此 job 红）
-#   B: macos-15 + Xcode 16.4 构建 + vtool 改写二进制 minos 13.0→12.0（兜底）
-# 判定：两路线都校验最终二进制 minos==12.0 并修正 Info.plist，绿了才出 artifact
+# 原理：所有现代 Xcode SDK 链接期 minos 下限为 13.0，无法原生出 iOS 12 包；
+#      因此构建时强制部署目标 12.0（保证源码按 iOS 12 语义编译），
+#      构建后用 Apple 官方 vtool 把二进制 minos 改写回 12.0，并修正 Info.plist。
+# 校验：包内全部 Mach-O（排除 dSYM）minos 必须 == 12.0，否则 job 失败并上传诊断。
 name: Build WebDriverAgent (unsigned, iOS 12)
 
 on:
   workflow_dispatch:
 
 jobs:
-  xcode15-native:
-    name: A. macos-14 + Xcode 15.4 (native)
-    runs-on: macos-14
-    steps:
-      - name: Xcode version
-        run: xcodebuild -version
-
-      - name: Select Xcode 15.4
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '15.4'
-
-      - name: Checkout official WebDriverAgent source (v10.5.4)
-        uses: actions/checkout@v4
-        with:
-          repository: appium/WebDriverAgent
-          ref: v10.5.4
-
-      - name: Build (unsigned, forced iOS 12.0 target, real device)
-        run: |
-          xcodebuild build-for-testing \
-            -project WebDriverAgent.xcodeproj \
-            -scheme WebDriverAgentRunner \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
-
-      - name: Verify and fix plist
-        run: |
-          APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
-          test -d "$APP" || { echo "== app not found =="; find build -maxdepth 5 -name '*.app'; exit 1; }
-          xcrun vtool -show-build "$APP/WebDriverAgentRunner-Runner"
-          MINOS=$(xcrun vtool -show-build "$APP/WebDriverAgentRunner-Runner" | grep -m1 minos | awk '{print $2}')
-          echo "binary minos = $MINOS"
-          case "$MINOS" in
-            12.*) ;;
-            *) echo "FAIL: minos=$MINOS"; exit 1 ;;
-          esac
-          plutil -remove MinimumOSVersion "$APP/Info.plist" 2>/dev/null || true
-          plutil -insert MinimumOSVersion -string "12.0" "$APP/Info.plist"
-
-      - name: Package ipa
-        run: |
-          APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
-          mkdir Payload
-          cp -R "$APP" Payload/
-          zip -qry WebDriverAgent.ipa Payload
-          ls -la WebDriverAgent.ipa
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: WebDriverAgent-v10.5.4-xcode15-ipa
-          path: WebDriverAgent.ipa
-
-  xcode16-patched:
-    name: B. macos-15 + Xcode 16.4 + vtool patch
+  build:
+    name: Build + patch minos 12.0
     runs-on: macos-15
     steps:
       - name: Xcode version
@@ -95,35 +36,40 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
-      - name: Rewrite binary minos 13.0 -> 12.0 (all Mach-O in bundle)
+      - name: Rewrite binary minos to 12.0 and fix plists
         run: |
           APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
           test -d "$APP" || { echo "== app not found =="; find build -maxdepth 5 -name '*.app'; exit 1; }
-          find "$APP" -type f | while read -r f; do
-            if file "$f" | grep -q "Mach-O"; then
-              if xcrun vtool -show-build "$f" 2>/dev/null | grep -q "platform IOS"; then
-                echo "patching: $f"
-                xcrun vtool -set-build-version ios 12.0 18.4 -replace -output "$f.tmp" "$f"
-                mv "$f.tmp" "$f"
-              fi
-            fi
-          done
-          echo "== verify all patched =="
-          BAD=0
-          find "$APP" -type f | while read -r f; do
-            if file "$f" | grep -q "Mach-O"; then
-              if xcrun vtool -show-build "$f" 2>/dev/null | grep -q "platform IOS"; then
-                M=$(xcrun vtool -show-build "$f" | grep -m1 minos | awk '{print $2}')
-                echo "$f -> minos $M"
-                case "$M" in 12.*) ;; *) exit 1 ;; esac
-              fi
-            fi
-          done || BAD=1
-          [ "$BAD" = "0" ] || { echo "FAIL: some binaries still not minos 12"; exit 1; }
 
-      - name: Fix plist MinimumOSVersion
-        run: |
-          APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
+          # dSYM 是调试符号，不进安装包，vtool 改写它也会段错误
+          rm -rf "$APP/PlugIns/WebDriverAgentRunner.xctest.dSYM"
+
+          FILES=$(find "$APP" -type f ! -path '*.dSYM*')
+
+          echo "== patching =="
+          for f in $FILES; do
+            file "$f" | grep -q "Mach-O" || continue
+            xcrun vtool -show-build "$f" 2>/dev/null | grep -q "platform IOS" || continue
+            echo "patching: $f"
+            xcrun vtool -set-build-version ios 12.0 18.4 -replace -output "$f.tmp" "$f"
+            mv "$f.tmp" "$f"
+          done
+
+          echo "== verify all IOS Mach-O minos == 12 =="
+          : > bad.txt
+          for f in $FILES; do
+            file "$f" | grep -q "Mach-O" || continue
+            xcrun vtool -show-build "$f" 2>/dev/null | grep -q "platform IOS" || continue
+            M=$(xcrun vtool -show-build "$f" | grep -m1 minos | awk '{print $2}')
+            echo "$f -> minos $M"
+            case "$M" in
+              12.*) ;;
+              *) echo "$f" >> bad.txt ;;
+            esac
+          done
+          if [ -s bad.txt ]; then echo "FAIL: minos not 12:"; cat bad.txt; exit 1; fi
+
+          echo "== fix plists =="
           plutil -remove MinimumOSVersion "$APP/Info.plist" 2>/dev/null || true
           plutil -insert MinimumOSVersion -string "12.0" "$APP/Info.plist"
           XCT="$APP/PlugIns/WebDriverAgentRunner.xctest/Info.plist"
@@ -131,6 +77,7 @@ jobs:
             plutil -remove MinimumOSVersion "$XCT" 2>/dev/null || true
             plutil -insert MinimumOSVersion -string "12.0" "$XCT"
           fi
+          echo "plist MinimumOSVersion = $(plutil -extract MinimumOSVersion raw "$APP/Info.plist")"
 
       - name: Package ipa
         run: |
@@ -143,5 +90,24 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WebDriverAgent-v10.5.4-patched-ipa
+          name: WebDriverAgent-v10.5.4-ipa
           path: WebDriverAgent.ipa
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p diag
+          APP=$(find build -maxdepth 5 -path '*Release-iphoneos*Runner.app' | head -1)
+          if [ -n "$APP" ]; then
+            cp "$APP/Info.plist" diag/app-Info.plist 2>/dev/null || true
+            xcrun vtool -show-build "$APP/WebDriverAgentRunner-Runner" > diag/vtool.txt 2>&1 || true
+            cat bad.txt > diag/bad-files.txt 2>/dev/null || true
+          fi
+          git rev-parse HEAD > diag/head.txt
+
+      - name: Upload diagnostic artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: diag/
