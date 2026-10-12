@@ -1,27 +1,43 @@
 # 用途：从官方 appium/WebDriverAgent 源码构建 iOS 12 可用的 WDA（未签名 ipa）
 # 放置位置：仓库根目录 .github/workflows/build-wda.yml（覆盖旧内容）
-# 原理：所有现代 Xcode SDK 链接期 minos 下限为 13.0，无法原生出 iOS 12 包；
-#      因此构建时强制部署目标 12.0（保证源码按 iOS 12 语义编译），
-#      构建后用 Apple 官方 vtool 把二进制 minos 改写回 12.0，并修正 Info.plist。
-# 校验：包内全部 Mach-O（排除 dSYM）minos 必须 == 12.0，否则 job 失败并上传诊断。
-name: Build WebDriverAgent (unsigned, iOS 12)
+# 关键点：必须用 Xcode 15.2（SDK 17.2，最后一代支持 iOS 12 部署的 SDK）。
+#        Xcode 15.4+/16.x 的 XCTest 框架族硬引用 ___chkstk_darwin（iOS 13.4+ 才有），
+#        在 iOS 12 上 dyld 加载即崩（已实测）。SDK 17.2 无此问题。
+# 校验：1) 全部 Mach-O minos == 12；2) 内嵌框架无 ___chkstk_darwin 未定义引用；
+#        3) Info.plist MinimumOSVersion == 12。任一不满足则 job 失败。
+name: Build WebDriverAgent (unsigned, iOS 12, Xcode 15.2)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build + patch minos 12.0
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - wda_ref: v10.5.4
+            artifact: WebDriverAgent-v10.5.4-xc152-ipa
+          - wda_ref: v9.15.3
+            artifact: WebDriverAgent-v9.15.3-xc152-ipa
+    runs-on: macos-14
+    name: Build ${{ matrix.wda_ref }} @ Xcode 15.2
     steps:
-      - name: Xcode version
-        run: xcodebuild -version
+      - name: Select Xcode 15.2
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.2'
 
-      - name: Checkout official WebDriverAgent source (v10.5.4)
+      - name: Show versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version || true
+
+      - name: Checkout official WebDriverAgent source (${{ matrix.wda_ref }})
         uses: actions/checkout@v4
         with:
           repository: appium/WebDriverAgent
-          ref: v10.5.4
+          ref: ${{ matrix.wda_ref }}
 
       - name: Build (unsigned, forced iOS 12.0 target, real device)
         run: |
@@ -36,40 +52,34 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
-      - name: Rewrite binary minos to 12.0 and fix plists
+      - name: Rewrite minos to 12.0 if needed and fix plists
         run: |
           APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
           test -d "$APP" || { echo "== app not found =="; find build -maxdepth 5 -name '*.app'; exit 1; }
-
-          # dSYM 是调试符号，不进安装包，vtool 改写它也会段错误
           rm -rf "$APP/PlugIns/WebDriverAgentRunner.xctest.dSYM"
-
           FILES=$(find "$APP" -type f ! -path '*.dSYM*')
-
-          echo "== patching =="
           for f in $FILES; do
             file "$f" | grep -q "Mach-O" || continue
             xcrun vtool -show-build "$f" 2>/dev/null | grep -q "platform IOS" || continue
-            echo "patching: $f"
-            xcrun vtool -set-build-version ios 12.0 18.4 -replace -output "$f.tmp" "$f"
-            mv "$f.tmp" "$f"
+            M=$(xcrun vtool -show-build "$f" | grep -m1 minos | awk '{print $2}')
+            case "$M" in
+              12.*) echo "minos ok: $f ($M)" ;;
+              *)
+                echo "patching minos $M -> 12.0: $f"
+                xcrun vtool -set-build-version ios 12.0 17.2 -replace -output "$f.tmp" "$f"
+                mv "$f.tmp" "$f"
+                ;;
+            esac
           done
-
-          echo "== verify all IOS Mach-O minos == 12 =="
           : > bad.txt
           for f in $FILES; do
             file "$f" | grep -q "Mach-O" || continue
             xcrun vtool -show-build "$f" 2>/dev/null | grep -q "platform IOS" || continue
             M=$(xcrun vtool -show-build "$f" | grep -m1 minos | awk '{print $2}')
             echo "$f -> minos $M"
-            case "$M" in
-              12.*) ;;
-              *) echo "$f" >> bad.txt ;;
-            esac
+            case "$M" in 12.*) ;; *) echo "$f" >> bad.txt ;; esac
           done
           if [ -s bad.txt ]; then echo "FAIL: minos not 12:"; cat bad.txt; exit 1; fi
-
-          echo "== fix plists =="
           plutil -remove MinimumOSVersion "$APP/Info.plist" 2>/dev/null || true
           plutil -insert MinimumOSVersion -string "12.0" "$APP/Info.plist"
           XCT="$APP/PlugIns/WebDriverAgentRunner.xctest/Info.plist"
@@ -77,7 +87,24 @@ jobs:
             plutil -remove MinimumOSVersion "$XCT" 2>/dev/null || true
             plutil -insert MinimumOSVersion -string "12.0" "$XCT"
           fi
-          echo "plist MinimumOSVersion = $(plutil -extract MinimumOSVersion raw "$APP/Info.plist")"
+
+      - name: Symbol scan (undefined symbols absent on iOS 12)
+        run: |
+          APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
+          : > badsym.txt
+          for fw in "$APP"/Frameworks/* "$APP"/PlugIns/WebDriverAgentRunner.xctest/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            if [ -d "$fw" ]; then BIN="$fw/$(basename "$fw" .framework)"; else BIN="$fw"; fi
+            [ -f "$BIN" ] || continue
+            file "$BIN" | grep -q "Mach-O" || continue
+            if xcrun nm -u "$BIN" 2>/dev/null | grep -q "___chkstk_darwin"; then
+              echo "$BIN references ___chkstk_darwin" >> badsym.txt
+            fi
+          done
+          if [ -s badsym.txt ]; then
+            echo "FAIL: iOS13.4+ only symbols found:"; cat badsym.txt; exit 1
+          fi
+          echo "symbol scan clean"
 
       - name: Package ipa
         run: |
@@ -90,7 +117,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WebDriverAgent-v10.5.4-ipa
+          name: ${{ matrix.artifact }}
           path: WebDriverAgent.ipa
 
       - name: Upload diagnostics on failure
@@ -100,8 +127,8 @@ jobs:
           APP=$(find build -maxdepth 5 -path '*Release-iphoneos*Runner.app' | head -1)
           if [ -n "$APP" ]; then
             cp "$APP/Info.plist" diag/app-Info.plist 2>/dev/null || true
-            xcrun vtool -show-build "$APP/WebDriverAgentRunner-Runner" > diag/vtool.txt 2>&1 || true
-            cat bad.txt > diag/bad-files.txt 2>/dev/null || true
+            cat badsym.txt > diag/bad-symbols.txt 2>/dev/null || true
+            cat bad.txt > diag/bad-minos.txt 2>/dev/null || true
           fi
           git rev-parse HEAD > diag/head.txt
 
@@ -109,5 +136,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics
+          name: diagnostics-${{ matrix.wda_ref }}
           path: diag/
