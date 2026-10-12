@@ -1,7 +1,8 @@
 # 用途：从官方 appium/WebDriverAgent 源码构建 iOS 12 可用的 WDA（未签名 ipa）
 # 放置位置：仓库根目录 .github/workflows/build-wda.yml（覆盖旧内容）
-# 运行方式：Actions → Run workflow → 两个 job 并行跑 v10.5.4 / v9.15.3
-#          下载“成功且未变红”那个 job 的 artifact（优先 v10.5.4）
+# 判定逻辑：以二进制的 LC_BUILD_VERSION minos 为准（真正决定能否在 iOS 12 运行）
+#   minos=12.x → 自动把 Info.plist 的 MinimumOSVersion 改写为 12.0 → 打包上传（绿）
+#   minos≠12.x → 上传 diagnostics 诊断包 → job 失败（红）
 name: Build WebDriverAgent (unsigned, iOS 12)
 
 on:
@@ -35,8 +36,6 @@ jobs:
           git rev-parse HEAD
           echo "== deployment target occurrences in pbxproj =="
           grep -o "IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*" WebDriverAgent.xcodeproj/project.pbxproj | sort | uniq -c
-          echo "== effective build settings =="
-          xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -showBuildSettings 2>/dev/null | grep -E "IPHONEOS_DEPLOYMENT_TARGET|MAXIMUM_VALID" || true
 
       - name: Build (unsigned, forced iOS 12.0 target, real device)
         run: |
@@ -51,13 +50,32 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
-      - name: Verify built MinimumOSVersion == 12.0 (hard check)
+      - name: Verify binary minos and fix plist
         run: |
           APP="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
-          test -d "$APP" || { find build -maxdepth 5 -name '*.app'; exit 1; }
-          MIN=$(plutil -extract MinimumOSVersion raw "$APP/Info.plist")
-          echo "built MinimumOSVersion = $MIN"
-          [ "$MIN" = "12.0" ] || { echo "FAIL: expected 12.0, got $MIN"; exit 1; }
+          test -d "$APP" || { echo "== app not found, searching =="; find build -maxdepth 5 -name '*.app'; exit 1; }
+          echo "== plist MinimumOSVersion (as built) =="
+          plutil -extract MinimumOSVersion raw "$APP/Info.plist" || echo "(missing)"
+          echo "== binary build metadata =="
+          xcrun vtool -show-build "$APP/WebDriverAgentRunner-Runner" || true
+          MINOS=$(xcrun vtool -show-build "$APP/WebDriverAgentRunner-Runner" | grep -m1 minos | awk '{print $2}')
+          echo "binary minos = $MINOS"
+          case "$MINOS" in
+            12.*)
+              echo "binary targets iOS 12 — rewriting plist MinimumOSVersion to 12.0"
+              plutil -remove MinimumOSVersion "$APP/Info.plist" 2>/dev/null || true
+              plutil -insert MinimumOSVersion -string "12.0" "$APP/Info.plist"
+              XCT="$APP/PlugIns/WebDriverAgentRunner.xctest/Info.plist"
+              if [ -f "$XCT" ]; then
+                plutil -remove MinimumOSVersion "$XCT" 2>/dev/null || true
+                plutil -insert MinimumOSVersion -string "12.0" "$XCT"
+              fi
+              ;;
+            *)
+              echo "FAIL: binary does not target iOS 12 (minos=$MINOS)"
+              exit 1
+              ;;
+          esac
 
       - name: Package ipa
         run: |
@@ -67,8 +85,27 @@ jobs:
           zip -qry WebDriverAgent.ipa Payload
           ls -la WebDriverAgent.ipa
 
-      - name: Upload artifact
+      - name: Upload ipa artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: WebDriverAgent.ipa
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p diag
+          APP=$(find build -maxdepth 5 -path '*Release-iphoneos*Runner.app' | head -1)
+          if [ -n "$APP" ]; then
+            cp "$APP/Info.plist" diag/app-Info.plist || true
+            xcrun vtool -show-build "$APP/WebDriverAgentRunner-Runner" > diag/vtool.txt 2>&1 || true
+          fi
+          xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner -showBuildSettings 2>/dev/null | grep -E "IPHONEOS_DEPLOYMENT_TARGET|PLATFORM_NAME|PRODUCT_BUNDLE" > diag/settings.txt || true
+          git rev-parse HEAD > diag/head.txt
+
+      - name: Upload diagnostic artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.wda_ref }}
+          path: diag/
